@@ -571,8 +571,33 @@ def extract_simple_sheet(file):
     return data
 
 def extract_goods_name(title: str) -> str:
-    m = re.search(r"【(.+?)】", title)
-    return m.group(1) if m else title
+    """提取货品名称，过滤嵌套括号标签与交易属性"""
+    if not title:
+        return ""
+    
+    # 1. 自动过滤尾部的制表时间
+    title = clean_title(title)
+    
+    # 2. 自动剥离常见的排表后缀字样
+    title = re.sub(r"(排表|打表|肾表|统计表|结算表|汇总表|表)$", "", title).strip()
+    
+    # 3. 剥离可能存在的最外层嵌套大括号或方括号
+    name = title
+    if name.startswith("【") and name.endswith("】"):
+        name = name[1:-1].strip()
+    elif name.startswith("[") and name.endswith("]"):
+        name = name[1:-1].strip()
+        
+    # 4. 循环剥离头部的各种模式修饰前缀标签（单领/拼箱/端盒/抱盒等属性标签）
+    tag_pat = r"^(【(单领|非单领|拼箱|端盒|抱盒|拼套|拼盒|定金|全款|预售|现货|代购|拼/抱|拼)】|\[(单领|非单领|拼箱|端盒|抱盒|拼套|拼盒|定金|全款|预售|现货|代购|拼/抱|拼)\])\s*"
+    while True:
+        prev = name
+        name = re.sub(tag_pat, "", name).strip()
+        if name == prev:
+            break
+            
+    # 如果剥离到最后成空，退回到原始标题
+    return name if name else title
 
 
 def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
@@ -624,7 +649,7 @@ def build_import_records(selected_inputs: list[Tuple[Any, str]], api_key: str) -
             logs.append(f"{f.name} - {sheet_name} 解析失败: {e}")
             continue
 
-        # 默认提取货品名称
+        # 默认提取货品名称（使用优化后的解包算法）
         goods_name = extract_goods_name(title) if title else sheet_name
 
         # AI 辅助填写次名和类型
