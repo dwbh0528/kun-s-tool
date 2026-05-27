@@ -478,9 +478,24 @@ def extract_simple_sheet(file):
     return data
 
 def extract_goods_name(title: str) -> str:
-    """从标题【】内提取货品名称"""
-    m = re.search(r"【(.+?)】", title)
-    return m.group(1) if m else title
+    """
+    从标题提取货品名称：
+    - 普通格式 【xxx】排表 → xxx
+    - 嵌套格式 【【单领】xxx】排表 → xxx（去掉内部的【单领】等修饰词）
+    """
+    # 先去掉制表时间
+    t = re.sub(r"\s*制表时间：.*$", "", title).strip()
+    # 去掉末尾的"排表"
+    t = re.sub(r"排表$", "", t).strip()
+    # 找最外层【...】
+    m = re.match(r"^【(.+)】$", t)
+    if m:
+        inner = m.group(1)
+        # 去掉内部嵌套的【xxx】修饰词（如【单领】）
+        inner = re.sub(r"【[^【】]*】", "", inner).strip()
+        return inner if inner else t
+    # 没有【】包裹则直接返回
+    return t
 
 
 def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
@@ -517,59 +532,138 @@ def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
         return "", ""
 
 
+def parse_source_sheet(ws_df: pd.DataFrame, sheet_name: str) -> Tuple[str, List[str], List[float | None], List[Dict]]:
+    """
+    与 parse_source_file 逻辑相同，但接受已读取的 DataFrame 和 sheet 名称。
+    不砍配：直接提取所有有 CN 的格子（导入库需要原始记录）。
+    """
+    df = ws_df.reset_index(drop=True)
+
+    # 找 种类 行
+    header_idx = 0
+    for i in range(min(8, len(df))):
+        v = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
+        if v.strip() == "种类":
+            header_idx = i
+            break
+
+    raw_title = str(df.iat[0, 0]) if not pd.isna(df.iat[0, 0]) else ""
+    title = clean_title(raw_title).strip()
+    # fallback：行0为空则用 sheet 名称
+    if not title or title in ["nan", "None"]:
+        title = sheet_name.strip()
+
+    price_row_idx = header_idx + 1
+    if price_row_idx >= len(df):
+        return title, [], [], []
+
+    products = [str(v) for v in df.iloc[header_idx].fillna("").tolist()[1:]]
+    # 去掉末尾空列
+    while products and products[-1].strip() in ["", "nan", "None"]:
+        products.pop()
+
+    prices = [to_num(x) for x in df.iloc[price_row_idx].fillna("").tolist()[1:1 + len(products)]]
+
+    details = []
+    for r in range(price_row_idx + 1, len(df)):
+        row = df.iloc[r].tolist()
+        if pd.isna(row[0]):
+            continue
+        cells = row[1: 1 + len(products)]
+
+        def cell_has_cn(c):
+            return not (pd.isna(c) or str(c).strip() in ["", "nan", "None"])
+
+        # 导入库：不砍配，直接提取所有有 CN 的格子
+        for j, cell in enumerate(cells):
+            if not cell_has_cn(cell) or j >= len(products):
+                continue
+            name = str(cell).strip()
+            price = prices[j] if j < len(prices) else None
+            if name and products[j].strip() not in ["", "nan", "None"]:
+                details.append({
+                    "name": name,
+                    "product": products[j],
+                    "price": price,
+                    "title": title,
+                })
+
+    return title, products, prices, details
+
+
 def build_import_records(uploaded_files: list, api_key: str) -> Tuple[pd.DataFrame, List[str]]:
     """
-    从原始排表 xlsx 提取导入库记录。
-    每张排表调用一次 AI（只处理货品名称→次名+类型）。
+    从总表 xlsx 提取导入库记录。
+    每个文件读取所有 sheet，跳过"总表"/"明细"等汇总 sheet，
+    其余每个 sheet 作为一张排表解析。
+    每张排表调用一次 AI 推断次名和类型。
     """
     today = date.today()
     stock_deadline = today + relativedelta(months=4)
     drop_deadline = stock_deadline + relativedelta(months=1)
-    today_str = today.strftime("%Y/%m/%d")
     stock_str = stock_deadline.strftime("%Y/%m/%d")
     drop_str = drop_deadline.strftime("%Y/%m/%d")
 
+    SKIP_SHEETS = {"总表", "明细", "省流表", "详情表", "退补款", "导入库"}
     logs: List[str] = []
     rows: List[Dict] = []
 
     for f in uploaded_files:
         f.seek(0)
         try:
-            title, products, prices, details = parse_source_file(f)
+            xl = pd.ExcelFile(f, engine="openpyxl")
         except Exception as e:
-            logs.append(f"{f.name} 解析失败: {e}")
+            logs.append(f"{f.name} 读取失败: {e}")
             continue
 
-        goods_name = extract_goods_name(title)
+        for sname in xl.sheet_names:
+            if sname in SKIP_SHEETS:
+                logs.append(f"跳过 sheet：{sname}")
+                continue
 
-        # AI 填次名和类型（每张表调用一次）
-        ci_name, ci_type = "", ""
-        if api_key:
-            ci_name, ci_type = ai_fill_fields(goods_name, api_key)
-            if not ci_name or not ci_type:
-                logs.append(f"「{goods_name}」AI 返回为空，次名/类型留空")
-        else:
-            logs.append("未填写 API Key，次名/类型留空")
+            try:
+                ws_df = xl.parse(sname, header=None)
+            except Exception as e:
+                logs.append(f"sheet「{sname}」解析失败: {e}")
+                continue
 
-        # 统计每个 CN 购买的每个产品数量
-        cn_prod: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for d in details:
-            cn_prod[d["name"]][d["product"]] += 1
+            title, products, prices, details = parse_source_sheet(ws_df, sname)
 
-        # 每个 CN × 每个产品 生成一行
-        for cn, prod_qtys in cn_prod.items():
-            for prod, qty in prod_qtys.items():
-                rows.append({
-                    "货品名称": goods_name,
-                    "次名": ci_name,
-                    "人物": prod,
-                    "类型": ci_type,
-                    "数量": qty,
-                    "CN": cn,
-                    "物品状态": "未到货",
-                    "囤货期限": stock_str,
-                    "掉落期限": drop_str,
-                })
+            if not details:
+                logs.append(f"sheet「{sname}」无有效记录，跳过")
+                continue
+
+            goods_name = extract_goods_name(title)
+            logs.append(f"sheet「{sname}」→ 货品名称：{goods_name}，{len(details)} 条记录")
+
+            # AI 推断次名和类型（每张表一次）
+            ci_name, ci_type = "", ""
+            if api_key:
+                ci_name, ci_type = ai_fill_fields(goods_name, api_key)
+                if not ci_name or not ci_type:
+                    logs.append(f"  「{goods_name}」AI 返回为空，次名/类型留空")
+            else:
+                if not rows:  # 只提示一次
+                    logs.append("未填写 API Key，次名/类型留空")
+
+            # 统计每个 CN 购买每个产品的数量
+            cn_prod: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for d in details:
+                cn_prod[d["name"]][d["product"]] += 1
+
+            for cn, prod_qtys in cn_prod.items():
+                for prod, qty in prod_qtys.items():
+                    rows.append({
+                        "货品名称": goods_name,
+                        "次名": ci_name,
+                        "人物": prod,
+                        "类型": ci_type,
+                        "数量": qty,
+                        "CN": cn,
+                        "物品状态": "未到货",
+                        "囤货期限": stock_str,
+                        "掉落期限": drop_str,
+                    })
 
     df = pd.DataFrame(rows, columns=["货品名称","次名","人物","类型","数量","CN","物品状态","囤货期限","掉落期限"])
     return df, logs
@@ -663,22 +757,58 @@ with tab1:
             if ky not in st.session_state["ship_weights"]:
                 st.session_state["ship_weights"][ky] = {c: 0.0 for c in info["cols"]}
             with st.expander(f"配置重量: {info['title']}"):
-                m1, m2 = st.columns(2)
-                with m1:
-                    bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", step=10.0)
-                with m2:
-                    bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
-                if st.button("一键平均填充", key=f"btn_{ky}"):
-                    for c in info["cols"]:
-                        st.session_state["ship_weights"][ky][c] = bt / max(bc, 1)
-                    st.rerun()
+                mode = st.radio("模式", ("A. 整盒配比", "B. 混合/关键词", "C. 统一重量"),
+                                key=f"mode_{ky}", horizontal=True)
+
+                if mode.startswith("A"):
+                    ma1, ma2 = st.columns(2)
+                    with ma1:
+                        bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", step=10.0)
+                    with ma2:
+                        bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
+                    if st.button("一键平均填充", key=f"btn_{ky}"):
+                        for c in info["cols"]:
+                            st.session_state["ship_weights"][ky][c] = bt / max(bc, 1)
+                            st.session_state[f"inp_{ky}_{c}"] = bt / max(bc, 1)
+                        st.rerun()
+
+                elif mode.startswith("B"):
+                    mb1, mb2, mb3 = st.columns([3, 2, 1])
+                    with mb1:
+                        kw = st.text_input("关键词（含此关键词的列填下方重量）", key=f"kw_{ky}")
+                    with mb2:
+                        kw_w = st.number_input("重量(g)", key=f"kww_{ky}", step=1.0)
+                    with mb3:
+                        st.write("")
+                        st.write("")
+                        if st.button("应用", key=f"kwbtn_{ky}"):
+                            for c in info["cols"]:
+                                if kw and kw in str(c):
+                                    st.session_state["ship_weights"][ky][c] = kw_w
+                                    st.session_state[f"inp_{ky}_{c}"] = kw_w
+                            st.rerun()
+
+                else:  # C. 统一重量
+                    mc1, mc2 = st.columns([3, 1])
+                    with mc1:
+                        uni_w = st.number_input("统一重量(g)", key=f"uni_{ky}", step=1.0)
+                    with mc2:
+                        st.write("")
+                        st.write("")
+                        if st.button("应用", key=f"unibtn_{ky}"):
+                            for c in info["cols"]:
+                                st.session_state["ship_weights"][ky][c] = uni_w
+                                st.session_state[f"inp_{ky}_{c}"] = uni_w
+                            st.rerun()
+
+                # 逐列微调
                 ci = st.columns(4)
                 for i, c in enumerate(info["cols"]):
-                    st.session_state["ship_weights"][ky][c] = ci[i % 4].number_input(
-                        str(c),
-                        value=float(st.session_state["ship_weights"][ky].get(c, 0.0)),
-                        key=f"inp_{ky}_{c}"
+                    cur_val = float(st.session_state["ship_weights"][ky].get(c, 0.0))
+                    new_val = ci[i % 4].number_input(
+                        str(c), value=cur_val, key=f"inp_{ky}_{c}", step=0.5, format="%.1f"
                     )
+                    st.session_state["ship_weights"][ky][c] = new_val
 
         if st.button("生成运费表", type="primary"):
             # 统计每人每产品数量和总重
