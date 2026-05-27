@@ -26,7 +26,7 @@ except Exception:
     _HAS_PYPINYIN = False
 
 # ─────────────────────────────────────────────
-# 1. 通用工具函数 (保留核心逻辑)
+# 1. 通用工具函数与默认文件自检
 # ─────────────────────────────────────────────
 
 def get_group_key(name: str) -> str:
@@ -59,11 +59,51 @@ def clean_title(title: str) -> str:
         return ""
     return re.sub(r"\s*制表时间：.*$", "", str(title)).strip()
 
+def get_image_bytes(img_file) -> io.BytesIO | None:
+    if not img_file:
+        return None
+    try:
+        img_file.seek(0)
+        data = img_file.read()
+        img_file.seek(0)
+        return io.BytesIO(data)
+    except Exception:
+        return None
+
+def load_default_images() -> Tuple[Any, List[Any]]:
+    """自动读取仓库中预设的图片资源作为默认收款码和背景"""
+    left_img = None
+    qr_images = []
+    
+    # 自动检索默认背景
+    for ext in ["png", "jpg", "jpeg"]:
+        p = Path(f"left_bg.{ext}")
+        if p.exists():
+            try:
+                with open(p, "rb") as f:
+                    left_img = io.BytesIO(f.read())
+                break
+            except Exception:
+                pass
+                
+    # 自动检索默认收款码文件夹
+    qr_folder = Path("qr_codes")
+    if qr_folder.exists() and qr_folder.is_dir():
+        for ext in ["png", "jpg", "jpeg"]:
+            for p in sorted(qr_folder.glob(f"*.{ext}")):
+                try:
+                    with open(p, "rb") as f:
+                        qr_images.append(io.BytesIO(f.read()))
+                except Exception:
+                    pass
+    return left_img, qr_images
+
 # ─────────────────────────────────────────────
-# 2. 源表解析逻辑 (恢复最复杂的抱盒修复逻辑)
+# 2. 源表解析与砍配过滤逻辑
 # ─────────────────────────────────────────────
 
 def parse_source_file(uploaded_file) -> Tuple[str, List[str], List[float | None], List[Dict]]:
+    uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file, header=None, engine="openpyxl", keep_default_na=True)
     header_idx = 0
     for i in range(min(8, len(df))):
@@ -112,6 +152,58 @@ def parse_source_file(uploaded_file) -> Tuple[str, List[str], List[float | None]
                         details.append({"name": name, "product": products[j], "price": price, "title": title})
     return title, products, prices, details
 
+def get_allocated_source_df(uploaded_file) -> pd.DataFrame:
+    """提取经过砍配逻辑过滤之后的源表 DataFrame，未成功匹配的行与冷门单元格将被清空"""
+    uploaded_file.seek(0)
+    df = pd.read_excel(uploaded_file, header=None, engine="openpyxl", keep_default_na=True)
+    header_idx = 0
+    for i in range(min(8, len(df))):
+        v = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
+        if v.strip() == "种类":
+            header_idx = i
+            break
+            
+    raw_title = str(df.iat[0, 0]) if not pd.isna(df.iat[0, 0]) else ""
+    title = clean_title(raw_title)
+    
+    price_row_idx = header_idx + 1
+    products = [str(v) for v in df.iloc[header_idx].fillna("").tolist()[1:]]
+    prices = [to_num(x) for x in df.iloc[price_row_idx].fillna("").tolist()[1:]]
+    
+    is_single = "单领" in title
+    is_box_col = ["抱盒" in p or "端盒" in p for p in products]
+    
+    keep_rows = list(range(price_row_idx + 1))
+    
+    for r in range(price_row_idx + 1, len(df)):
+        row = df.iloc[r].tolist()
+        if pd.isna(row[0]):
+            continue
+        cells = row[1: 1 + len(products)]
+        
+        def cell_has_cn(c):
+            return not (pd.isna(c) or str(c).strip() == "")
+            
+        if is_single:
+            has_any = any(cell_has_cn(cells[j]) and j < len(products) for j in range(len(cells)))
+            if has_any:
+                keep_rows.append(r)
+        else:
+            non_box_filled = [cell_has_cn(cells[j]) for j in range(len(cells)) if j < len(is_box_col) and not is_box_col[j]]
+            row_ready = len(non_box_filled) > 0 and all(non_box_filled)
+            has_box_filled = any(cell_has_cn(cells[j]) for j, is_box in enumerate(is_box_col) if is_box and j < len(cells))
+            
+            if row_ready or has_box_filled:
+                keep_rows.append(r)
+                if not row_ready:
+                    # 如果这盒没能拼成，只保留抱盒或端盒，其余散件清空
+                    for j in range(len(products)):
+                        if j < len(is_box_col) and not is_box_col[j]:
+                            df.iat[r, 1 + j] = None
+                            
+    filtered_df = df.iloc[keep_rows].copy()
+    return filtered_df
+
 def aggregate(details: List[Dict]):
     totals = defaultdict(float)
     per_person = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -121,7 +213,7 @@ def aggregate(details: List[Dict]):
     return per_person, totals
 
 # ─────────────────────────────────────────────
-# 3. 样式与视觉组件 (修复 DDL 只有数字问题)
+# 3. 样式与视觉组件
 # ─────────────────────────────────────────────
 
 THEMES = {
@@ -176,14 +268,28 @@ def draw_merged_group(ws, start_row, col, data_list, fmt):
         ws.write(start_row + start_idx, col, last_g, fmt)
 
 # ─────────────────────────────────────────────
-# 4. 顶栏 1/4 四分天下布局核心逻辑
+# 4. 顶栏 1/4 四分天下自适应逻辑
 # ─────────────────────────────────────────────
 
 def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, left_img, qr_images):
-    # 精确计算 25% 边界
-    c1 = max(1, total_cols // 4)
-    c2 = max(2, total_cols // 2)
-    c3 = max(3, (total_cols * 3) // 4)
+    # 强制使顶栏拥有至少 4 列的切分范围
+    if total_cols < 4:
+        total_cols = 4
+        
+    # 精确切分 25% 边界 
+    c1 = total_cols // 4
+    c2 = total_cols // 2
+    c3 = (total_cols * 3) // 4
+    
+    # 确保列分界不重叠且合理递增
+    if c1 < 1:
+        c1 = 1
+    if c2 <= c1:
+        c2 = c1 + 1
+    if c3 <= c2:
+        c3 = c2 + 1
+    if total_cols <= c3:
+        total_cols = c3 + 1
     
     # 第0行：大标题
     ws.merge_range(0, 0, 0, total_cols - 1, title_display, fmt["title_top"])
@@ -192,61 +298,61 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
     # 区域 1/4 (左)：名称或图片
     ws.merge_range(1, 0, 5, c1 - 1, title_display, fmt["left_name"])
     if left_img:
-        try:
-            left_img.seek(0)
-            ws.insert_image(1, 0, "left.png", {
-                "image_data": io.BytesIO(left_img.read()),
-                "x_scale": 0.5, "y_scale": 0.5,
-                "x_offset": 10, "y_offset": 5
-            })
-        except Exception:
-            pass
+        img_data = get_image_bytes(left_img)
+        if img_data:
+            try:
+                ws.insert_image(1, 0, "left.png", {
+                    "image_data": img_data,
+                    "x_scale": 0.5, "y_scale": 0.5,
+                    "x_offset": 10, "y_offset": 5
+                })
+            except Exception:
+                pass
             
     # 区域 2/4 (中左)：备注文字
     ws.merge_range(1, c1, 5, c2 - 1, "\n".join(notice_lines), fmt["notice_center"])
     
-    # 区域 3/4 (中右)：收款码
-    ws.merge_range(1, c2, 5, c3 - 1, "", fmt["notice_center"]) # 绘制背景边框
+    # 区域 3/4 (中右)：收款码区域
+    ws.merge_range(1, c2, 5, c3 - 1, "", fmt["notice_center"])
     if qr_images:
         for idx, qr in enumerate(qr_images[:2]):
-            try:
-                qr.seek(0)
-                # 在 1/4 区域内尝试横向偏移
-                x_off = 20 + (idx * 120)
-                ws.insert_image(1, c2, f"qr_{idx}.png", {
-                    "image_data": io.BytesIO(qr.read()),
-                    "x_scale": 0.5, "y_scale": 0.5,
-                    "x_offset": x_off, "y_offset": 15
-                })
-            except Exception:
-                pass
+            img_data = get_image_bytes(qr)
+            if img_data:
+                try:
+                    x_off = 20 + (idx * 120)
+                    ws.insert_image(1, c2, f"qr_{idx}.png", {
+                        "image_data": img_data,
+                        "x_scale": 0.5, "y_scale": 0.5,
+                        "x_offset": x_off, "y_offset": 15
+                    })
+                except Exception:
+                    pass
                 
     # 区域 4/4 (右)：DDL
     ws.merge_range(1, c3, 5, total_cols - 1, f"DDL\n{ddl_text}", fmt["ddl"])
     
-    # 设置顶栏高度 250+，确保收款码清晰
+    # 根据是否包含图片自适应高度：无图时矮化处理，有图时设为 55
+    has_images = bool(left_img or qr_images)
+    row_height = 55 if has_images else 22
     for r in range(1, 6):
-        ws.set_row(r, 55)
+        ws.set_row(r, row_height)
 
 # ─────────────────────────────────────────────
-# 5. 详情表写入 (对称、合并、四分顶栏)
+# 5. 详情表写入 (移除羊角标)
 # ─────────────────────────────────────────────
 
 def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, title_prices, rows_per_block, ddl_text, notice_lines, left_img, qr_images, custom_title):
-    """title_prices: {title: {product: price}}"""
     TOP_ROWS = 6
     col_map = [(t, p) for t in all_titles for p in title_products.get(t, [])]
     N_SIDE, N_PROD = 3, len(col_map)
     TOTAL_COLS = N_SIDE + N_PROD + N_SIDE
     sorted_names = sorted(totals.keys(), key=lambda n: (get_group_key(n), n))
     
-    # 渲染顶栏
     draw_top_banner(ws, fmt, TOTAL_COLS, custom_title or " / ".join(all_titles), notice_lines, ddl_text, left_img, qr_images)
 
     data_row = TOP_ROWS
     for i in range(0, len(sorted_names), rows_per_block):
         chunk = sorted_names[i : i + rows_per_block]
-        # 表头渲染：三行，左右侧列合并三行，产品列行0=谷名、行1=产品名、行2=单价
         for c, h in enumerate(["组", "CN", "总金额"]):
             ws.merge_range(data_row, c, data_row + 2, c, h, fmt["head"])
         curr = N_SIDE
@@ -260,14 +366,16 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
             for j, p in enumerate(prods):
                 ws.write(data_row + 1, curr + j, p, fmt["prod_head"])
                 price = (title_prices.get(t) or {}).get(p)
-                price_str = f"¥{price}" if price is not None else ""
-                ws.write(data_row + 2, curr + j, price_str, fmt["prod_head"])
+                # 移除此处品种价格前的 “¥” 羊角标
+                if price is not None:
+                    ws.write(data_row + 2, curr + j, price, fmt["prod_head"])
+                else:
+                    ws.write(data_row + 2, curr + j, "", fmt["prod_head"])
             curr += n
         for c, h in enumerate(["总金额", "CN", "组"]):
             ws.merge_range(data_row, curr + c, data_row + 2, curr + c, h, fmt["head"])
         
         data_row += 3
-        # 数据行渲染
         for r_idx, name in enumerate(chunk):
             r = data_row + r_idx
             st_f = fmt["odd"] if r_idx % 2 == 0 else fmt["even"]
@@ -281,12 +389,10 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
             ws.write(r, N_SIDE + N_PROD + 1, name, st_f)
             ws.set_row(r, 18)
         
-        # 处理侧边组列合并
         draw_merged_group(ws, data_row, 0, chunk, fmt["group"])
         draw_merged_group(ws, data_row, TOTAL_COLS - 1, chunk, fmt["group"])
         data_row += len(chunk)
 
-    # CN 宽度固定 22
     ws.set_column(0, 0, 5)
     ws.set_column(1, 1, 22)
     ws.set_column(2, 2, 12)
@@ -297,7 +403,7 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
     ws.set_column(TOTAL_COLS - 1, TOTAL_COLS - 1, 5)
 
 # ─────────────────────────────────────────────
-# 6. 省流表写入 (合并修复、CN列宽修复、收款码修复)
+# 6. 省流表写入
 # ─────────────────────────────────────────────
 
 def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, notice_lines, ddl_text, left_img):
@@ -307,8 +413,11 @@ def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, not
     num_blocks = math.ceil(len(rows_data) / rows_per_col)
     TOTAL_DATA_COLS = num_blocks * 4
     
-    # 渲染顶栏 (确保收款码显示)
-    draw_top_banner(ws, fmt, max(TOTAL_DATA_COLS, 12), title_text, notice_lines, ddl_text, left_img, qr_images)
+    # 限制最小定位列，防止小表头部错位
+    if TOTAL_DATA_COLS < 8:
+        TOTAL_DATA_COLS = 8
+    
+    draw_top_banner(ws, fmt, TOTAL_DATA_COLS, title_text, notice_lines, ddl_text, left_img, qr_images)
 
     for b in range(num_blocks):
         c0 = b * 4
@@ -323,30 +432,23 @@ def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, not
             ws.write(r, c0 + 1, d["name"], st_f)
             ws.write(r, c0 + 2, d["amount"], mn_f)
         
-        # 补全分组合并逻辑
         draw_merged_group(ws, TOP_ROWS + 1, c0, chunk, fmt["group"])
         ws.set_column(c0, c0, 5)
-        ws.set_column(c0 + 1, c0 + 1, 22) # CN 列宽 22
+        ws.set_column(c0 + 1, c0 + 1, 22) 
         ws.set_column(c0 + 2, c0 + 2, 12)
         ws.set_column(c0 + 3, c0 + 3, 1)
 
+    # 格式化填充补位列
+    for c in range(num_blocks * 4, TOTAL_DATA_COLS):
+        ws.set_column(c, c, 12)
+
 # ─────────────────────────────────────────────
-# 7. 国际运费表写入 (对齐省流表格式，三行表头)
+# 7. 国际运费表写入
 # ─────────────────────────────────────────────
 
 def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_text, notice_lines, left_img, qr_images):
-    """
-    ship_blocks: List of {
-        "title": str,           谷子名称
-        "products": [str],      产品列名
-        "prod_fees": {str: float},  产品→运费金额
-        "entries": [{group, name, prod_amounts: {prod: qty}}]
-    }
-    最终输出格式完全对齐省流表：组|CN|[产品列三行表头]|总运费，横向分栏
-    """
     TOP_ROWS = 6
 
-    # 展开所有人的数据，按首字母排序
     all_names_set = {}
     for blk in ship_blocks:
         for e in blk["entries"]:
@@ -356,13 +458,10 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
             for prod, qty in e["prod_amounts"].items():
                 all_names_set[n][blk["title"]][prod] += qty
 
-    # 构建 col_map：[(title, product), ...]
     col_map = [(blk["title"], p) for blk in ship_blocks for p in blk["products"]]
-    # prod_fee_map: {(title, prod): fee}
     prod_fee_map = {(blk["title"], p): blk["prod_fees"].get(p, 0.0)
                     for blk in ship_blocks for p in blk["products"]}
 
-    # 按首字母排序
     sorted_names = sorted(all_names_set.keys(), key=lambda n: (get_group_key(n), n))
     rows_data = []
     for name in sorted_names:
@@ -380,16 +479,16 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
     if not rows_data:
         return
 
-    # 列结构：组(1) + CN(1) + 产品列(N) + 总运费(1) = N+3，间隔(1) = N+4
     N_PROD = len(col_map)
-    BLOCK_W = 2 + N_PROD + 1   # 组+CN+产品列+总运费
-    STEP = BLOCK_W + 1          # +间隔列
+    BLOCK_W = 2 + N_PROD + 1   
+    STEP = BLOCK_W + 1          
     num_blocks = math.ceil(len(rows_data) / rows_per_col)
-    TOTAL_DATA_COLS = max(num_blocks * STEP, 12)
+    TOTAL_DATA_COLS = num_blocks * STEP
+    if TOTAL_DATA_COLS < 8:
+        TOTAL_DATA_COLS = 8
 
     draw_top_banner(ws, fmt, TOTAL_DATA_COLS, title_text, notice_lines, ddl_text, left_img, qr_images)
 
-    # 表头行偏移：三行（谷名/产品名/运费金额）
     HEADER_ROWS = 3
     data_header_row = TOP_ROWS
 
@@ -397,8 +496,6 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
         c0 = b * STEP
         chunk = rows_data[b * rows_per_col: (b + 1) * rows_per_col]
 
-        # ── 表头三行 ──
-        # 行0: 组(合并3行) | CN(合并3行) | 谷名(按谷合并) | 总运费(合并3行)
         ws.merge_range(data_header_row, c0, data_header_row + 2, c0, "组", fmt["head"])
         ws.merge_range(data_header_row, c0 + 1, data_header_row + 2, c0 + 1, "CN", fmt["head"])
 
@@ -418,7 +515,6 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
 
         ws.merge_range(data_header_row, curr, data_header_row + 2, curr, "总运费", fmt["head"])
 
-        # ── 数据行 ──
         data_row = data_header_row + HEADER_ROWS
         for i, d in enumerate(chunk):
             r = data_row + i
@@ -433,16 +529,15 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
 
         draw_merged_group(ws, data_row, c0, chunk, fmt["group"])
 
-        # ── 列宽 ──
         ws.set_column(c0, c0, 5)
         ws.set_column(c0 + 1, c0 + 1, 22)
         for ci in range(N_PROD):
             ws.set_column(c0 + 2 + ci, c0 + 2 + ci, 8)
         ws.set_column(c0 + 2 + N_PROD, c0 + 2 + N_PROD, 12)
-        ws.set_column(c0 + BLOCK_W, c0 + BLOCK_W, 1)  # 间隔
+        ws.set_column(c0 + BLOCK_W, c0 + BLOCK_W, 1)
 
 # ─────────────────────────────────────────────
-# 8. 其余完整函数 (恢复退补款与库功能)
+# 8. 其余完整函数
 # ─────────────────────────────────────────────
 
 def extract_simple_sheet(file):
@@ -461,7 +556,6 @@ def extract_simple_sheet(file):
             nc, ac = cs + 1, cs + 2
             if ac > ws.max_column:
                 break
-            # 兼容不同列名
             header = str(ws.cell(1, nc).value or "").lower()
             if not any(x in header for x in ["cn", "姓名", "名字"]):
                 continue
@@ -478,31 +572,11 @@ def extract_simple_sheet(file):
     return data
 
 def extract_goods_name(title: str) -> str:
-    """
-    从标题提取货品名称：
-    - 普通格式 【xxx】排表 → xxx
-    - 嵌套格式 【【单领】xxx】排表 → xxx（去掉内部的【单领】等修饰词）
-    """
-    # 先去掉制表时间
-    t = re.sub(r"\s*制表时间：.*$", "", title).strip()
-    # 去掉末尾的"排表"
-    t = re.sub(r"排表$", "", t).strip()
-    # 找最外层【...】
-    m = re.match(r"^【(.+)】$", t)
-    if m:
-        inner = m.group(1)
-        # 去掉内部嵌套的【xxx】修饰词（如【单领】）
-        inner = re.sub(r"【[^【】]*】", "", inner).strip()
-        return inner if inner else t
-    # 没有【】包裹则直接返回
-    return t
+    m = re.search(r"【(.+?)】", title)
+    return m.group(1) if m else title
 
 
 def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
-    """
-    调用 DeepSeek API，根据货品名称推断：次名（简称）和类型
-    返回 (次名, 类型)
-    """
     try:
         resp = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -532,138 +606,52 @@ def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
         return "", ""
 
 
-def parse_source_sheet(ws_df: pd.DataFrame, sheet_name: str) -> Tuple[str, List[str], List[float | None], List[Dict]]:
-    """
-    与 parse_source_file 逻辑相同，但接受已读取的 DataFrame 和 sheet 名称。
-    不砍配：直接提取所有有 CN 的格子（导入库需要原始记录）。
-    """
-    df = ws_df.reset_index(drop=True)
-
-    # 找 种类 行
-    header_idx = 0
-    for i in range(min(8, len(df))):
-        v = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
-        if v.strip() == "种类":
-            header_idx = i
-            break
-
-    raw_title = str(df.iat[0, 0]) if not pd.isna(df.iat[0, 0]) else ""
-    title = clean_title(raw_title).strip()
-    # fallback：行0为空则用 sheet 名称
-    if not title or title in ["nan", "None"]:
-        title = sheet_name.strip()
-
-    price_row_idx = header_idx + 1
-    if price_row_idx >= len(df):
-        return title, [], [], []
-
-    products = [str(v) for v in df.iloc[header_idx].fillna("").tolist()[1:]]
-    # 去掉末尾空列
-    while products and products[-1].strip() in ["", "nan", "None"]:
-        products.pop()
-
-    prices = [to_num(x) for x in df.iloc[price_row_idx].fillna("").tolist()[1:1 + len(products)]]
-
-    details = []
-    for r in range(price_row_idx + 1, len(df)):
-        row = df.iloc[r].tolist()
-        if pd.isna(row[0]):
-            continue
-        cells = row[1: 1 + len(products)]
-
-        def cell_has_cn(c):
-            return not (pd.isna(c) or str(c).strip() in ["", "nan", "None"])
-
-        # 导入库：不砍配，直接提取所有有 CN 的格子
-        for j, cell in enumerate(cells):
-            if not cell_has_cn(cell) or j >= len(products):
-                continue
-            name = str(cell).strip()
-            price = prices[j] if j < len(prices) else None
-            if name and products[j].strip() not in ["", "nan", "None"]:
-                details.append({
-                    "name": name,
-                    "product": products[j],
-                    "price": price,
-                    "title": title,
-                })
-
-    return title, products, prices, details
-
-
 def build_import_records(uploaded_files: list, api_key: str) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    从总表 xlsx 提取导入库记录。
-    每个文件读取所有 sheet，跳过"总表"/"明细"等汇总 sheet，
-    其余每个 sheet 作为一张排表解析。
-    每张排表调用一次 AI 推断次名和类型。
-    """
     today = date.today()
     stock_deadline = today + relativedelta(months=4)
     drop_deadline = stock_deadline + relativedelta(months=1)
+    today_str = today.strftime("%Y/%m/%d")
     stock_str = stock_deadline.strftime("%Y/%m/%d")
     drop_str = drop_deadline.strftime("%Y/%m/%d")
 
-    SKIP_SHEETS = {"总表", "明细", "省流表", "详情表", "退补款", "导入库"}
     logs: List[str] = []
     rows: List[Dict] = []
 
     for f in uploaded_files:
         f.seek(0)
         try:
-            xl = pd.ExcelFile(f, engine="openpyxl")
+            title, products, prices, details = parse_source_file(f)
         except Exception as e:
-            logs.append(f"{f.name} 读取失败: {e}")
+            logs.append(f"{f.name} 解析失败: {e}")
             continue
 
-        for sname in xl.sheet_names:
-            if sname in SKIP_SHEETS:
-                logs.append(f"跳过 sheet：{sname}")
-                continue
+        goods_name = extract_goods_name(title)
 
-            try:
-                ws_df = xl.parse(sname, header=None)
-            except Exception as e:
-                logs.append(f"sheet「{sname}」解析失败: {e}")
-                continue
+        ci_name, ci_type = "", ""
+        if api_key:
+            ci_name, ci_type = ai_fill_fields(goods_name, api_key)
+            if not ci_name or not ci_type:
+                logs.append(f"「{goods_name}」AI 返回为空，次名/类型留空")
+        else:
+            logs.append("未填写 API Key，次名/类型留空")
 
-            title, products, prices, details = parse_source_sheet(ws_df, sname)
+        cn_prod: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for d in details:
+            cn_prod[d["name"]][d["product"]] += 1
 
-            if not details:
-                logs.append(f"sheet「{sname}」无有效记录，跳过")
-                continue
-
-            goods_name = extract_goods_name(title)
-            logs.append(f"sheet「{sname}」→ 货品名称：{goods_name}，{len(details)} 条记录")
-
-            # AI 推断次名和类型（每张表一次）
-            ci_name, ci_type = "", ""
-            if api_key:
-                ci_name, ci_type = ai_fill_fields(goods_name, api_key)
-                if not ci_name or not ci_type:
-                    logs.append(f"  「{goods_name}」AI 返回为空，次名/类型留空")
-            else:
-                if not rows:  # 只提示一次
-                    logs.append("未填写 API Key，次名/类型留空")
-
-            # 统计每个 CN 购买每个产品的数量
-            cn_prod: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-            for d in details:
-                cn_prod[d["name"]][d["product"]] += 1
-
-            for cn, prod_qtys in cn_prod.items():
-                for prod, qty in prod_qtys.items():
-                    rows.append({
-                        "货品名称": goods_name,
-                        "次名": ci_name,
-                        "人物": prod,
-                        "类型": ci_type,
-                        "数量": qty,
-                        "CN": cn,
-                        "物品状态": "未到货",
-                        "囤货期限": stock_str,
-                        "掉落期限": drop_str,
-                    })
+        for cn, prod_qtys in cn_prod.items():
+            for prod, qty in prod_qtys.items():
+                rows.append({
+                    "货品名称": goods_name,
+                    "次名": ci_name,
+                    "人物": prod,
+                    "类型": ci_type,
+                    "数量": qty,
+                    "CN": cn,
+                    "物品状态": "未到货",
+                    "囤货期限": stock_str,
+                    "掉落期限": drop_str,
+                })
 
     df = pd.DataFrame(rows, columns=["货品名称","次名","人物","类型","数量","CN","物品状态","囤货期限","掉落期限"])
     return df, logs
@@ -685,8 +673,11 @@ def write_import_sheet(wb, df, fmt):
         ws.set_row(r, 16)
 
 def write_source_sheet(wb, title, uploaded_file, used_names):
+    """写入源表：自动应用砍配逻辑，只导出保留配上的有效数据"""
     try:
-        df = pd.read_excel(uploaded_file, header=None, engine="openpyxl")
+        # 获取砍配之后的 DataFrame
+        df = get_allocated_source_df(uploaded_file)
+        
         nm = re.sub(r"[\\/*\[\]:?'\"<>|]", "-", title)[:28] or "源表"
         bs, sf = nm, 1
         while nm in used_names:
@@ -694,7 +685,9 @@ def write_source_sheet(wb, title, uploaded_file, used_names):
             sf += 1
         used_names.add(nm)
         ws = wb.add_worksheet(nm)
-        for r_idx, row in df.iterrows():
+        
+        # 写入过滤后压缩的数据
+        for r_idx, row in enumerate(df.values):
             for c_idx, val in enumerate(row):
                 if pd.notna(val):
                     ws.write(r_idx, c_idx, val)
@@ -702,20 +695,38 @@ def write_source_sheet(wb, title, uploaded_file, used_names):
         pass
 
 # ═══════════════════════════════════════════════
-# 9. Streamlit UI (修复 Tab 4 逻辑与爆黄代码)
+# 9. Streamlit UI
 # ═══════════════════════════════════════════════
 
 st.set_page_config(page_title="谷团工具箱", layout="wide")
+
+# 加载本地/仓库预设的默认收款码与背景图
+default_left, default_qrs = load_default_images()
 
 with st.sidebar:
     st.header("全局顶栏设置")
     theme_choice = st.selectbox("选择主题色", list(THEMES.keys()), index=5)
     st.divider()
-    global_title = st.text_input("表格标题")
+    global_title = st.text_input("表格标题", value="")
     global_ddl = st.text_input("付款 DDL ", value="无特殊情况填写打表当日向后第七个自然日的晚上22:00")
     global_notice = st.text_area("中心备注大字 (中左 25%)", value="1.转账备注cn+本期谷子\n2.蓝绿双通无手续费\n3.拖肾一周内，每天请补交1r手续费，一周后未交掉落。两次及以上掉落记录飞机票\n4....", height=180)
-    global_left_img = st.file_uploader("左侧背景图", type=["png","jpg","jpeg"])
-    global_qr_imgs = st.file_uploader("收款码", type=["png","jpg","jpeg"], accept_multiple_files=True)
+    
+    # 允许上传自定义左图，否则自动加载默认
+    global_left_img = st.file_uploader("左侧背景图（不传则读取预设）", type=["png","jpg","jpeg"])
+    if not global_left_img and default_left:
+        st.caption("💡 已自动检索到默认左侧背景图 (left_bg)")
+        chosen_left_img = default_left
+    else:
+        chosen_left_img = global_left_img
+
+    # 允许上传自定义收款码，否则自动加载默认
+    global_qr_imgs = st.file_uploader("收款码（可多选，不传则读取预设）", type=["png","jpg","jpeg"], accept_multiple_files=True)
+    if not global_qr_imgs and default_qrs:
+        st.caption(f"💡 已自动检索到默认收款码文件夹中的 {len(default_qrs)} 张收款码 (qr_codes/)")
+        chosen_qr_imgs = default_qrs
+    else:
+        chosen_qr_imgs = global_qr_imgs
+
     st.divider()
     rows_per_col_global = st.number_input("省流表每栏行数", 10, 100, 25)
     rows_per_block_global = st.number_input("详情表重复表头行数", 10, 100, 30)
@@ -735,83 +746,86 @@ with tab1:
     if ship_files:
         if "ship_weights" not in st.session_state:
             st.session_state["ship_weights"] = {}
+            
         all_vcols = {}
         for f in ship_files:
             f.seek(0)
-            raw_t = str(pd.read_excel(f, header=None, engine="openpyxl").iat[0, 0])
-            f.seek(0)
-            df_s = pd.read_excel(f, header=1, engine="openpyxl")
-            bad = ["种类","序号","单价","总计","合计","Unnamed","备注","补款","余量"]
-            cols = [c for c in df_s.columns if str(c).strip() and not any(b in str(c) for b in bad)]
-            # 过滤空列：要求有至少一个非数字的 CN 值
-            valid = []
-            for c in cols:
-                vals = df_s[c].iloc[1:].dropna().astype(str).str.strip()
-                has_cn = vals[~vals.str.match(r"^\d+\.?\d*$")].any()
-                if has_cn:
-                    valid.append(c)
-            all_vcols[f.name] = {"cols": valid, "df": df_s, "title": clean_title(raw_t)}
+            xl = pd.ExcelFile(f)
+            sheet_names = xl.sheet_names
+            
+            # 默认过滤非数据用的 Sheet
+            default_exclude = ["详情表", "省流表", "汇总表", "运费表", "导入库", "Sheet1"]
+            candidate_sheets = [s for s in sheet_names if s not in default_exclude]
+            if not candidate_sheets:
+                candidate_sheets = sheet_names
+                
+            # 提供自主勾选与删除 Sheet 模块
+            selected_sheets = st.multiselect(
+                f"选择文件【{f.name}】中参与计算运费的 Sheet (可自由增删)",
+                options=sheet_names,
+                default=candidate_sheets,
+                key=f"sheets_{f.name}"
+            )
+            
+            if not selected_sheets:
+                continue
+                
+            for sheet in selected_sheets:
+                df_s_all = pd.read_excel(f, sheet_name=sheet, header=None, engine="openpyxl")
+                header_idx = 0
+                for i in range(min(8, len(df_s_all))):
+                    v = str(df_s_all.iat[i, 0]) if not pd.isna(df_s_all.iat[i, 0]) else ""
+                    if v.strip() == "种类":
+                        header_idx = i
+                        break
+                
+                raw_title = str(df_s_all.iat[0, 0]) if not pd.isna(df_s_all.iat[0, 0]) else sheet
+                clean_t = clean_title(raw_title) if raw_title else sheet
+                
+                f.seek(0)
+                df_s = pd.read_excel(f, sheet_name=sheet, header=header_idx, engine="openpyxl")
+                bad = ["种类","序号","单价","总计","合计","Unnamed","备注","补款","余量"]
+                cols = [c for c in df_s.columns if str(c).strip() and not any(b in str(c) for b in bad)]
+                
+                valid = []
+                for c in cols:
+                    vals = df_s[c].iloc[1:].dropna().astype(str).str.strip()
+                    has_cn = vals[~vals.str.match(r"^\d+\.?\d*$")].any()
+                    if has_cn:
+                        valid.append(c)
+                
+                if valid:
+                    all_vcols[f"{f.name} - {sheet}"] = {
+                        "cols": valid, 
+                        "df": df_s, 
+                        "title": clean_t,
+                        "file_name": f.name,
+                        "sheet_name": sheet
+                    }
 
         for fn, info in all_vcols.items():
             ky = f"ship_{fn}"
             if ky not in st.session_state["ship_weights"]:
                 st.session_state["ship_weights"][ky] = {c: 0.0 for c in info["cols"]}
-            with st.expander(f"配置重量: {info['title']}"):
-                mode = st.radio("模式", ("A. 整盒配比", "B. 混合/关键词", "C. 统一重量"),
-                                key=f"mode_{ky}", horizontal=True)
-
-                if mode.startswith("A"):
-                    ma1, ma2 = st.columns(2)
-                    with ma1:
-                        bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", step=10.0)
-                    with ma2:
-                        bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
-                    if st.button("一键平均填充", key=f"btn_{ky}"):
-                        for c in info["cols"]:
-                            st.session_state["ship_weights"][ky][c] = bt / max(bc, 1)
-                            st.session_state[f"inp_{ky}_{c}"] = bt / max(bc, 1)
-                        st.rerun()
-
-                elif mode.startswith("B"):
-                    mb1, mb2, mb3 = st.columns([3, 2, 1])
-                    with mb1:
-                        kw = st.text_input("关键词（含此关键词的列填下方重量）", key=f"kw_{ky}")
-                    with mb2:
-                        kw_w = st.number_input("重量(g)", key=f"kww_{ky}", step=1.0)
-                    with mb3:
-                        st.write("")
-                        st.write("")
-                        if st.button("应用", key=f"kwbtn_{ky}"):
-                            for c in info["cols"]:
-                                if kw and kw in str(c):
-                                    st.session_state["ship_weights"][ky][c] = kw_w
-                                    st.session_state[f"inp_{ky}_{c}"] = kw_w
-                            st.rerun()
-
-                else:  # C. 统一重量
-                    mc1, mc2 = st.columns([3, 1])
-                    with mc1:
-                        uni_w = st.number_input("统一重量(g)", key=f"uni_{ky}", step=1.0)
-                    with mc2:
-                        st.write("")
-                        st.write("")
-                        if st.button("应用", key=f"unibtn_{ky}"):
-                            for c in info["cols"]:
-                                st.session_state["ship_weights"][ky][c] = uni_w
-                                st.session_state[f"inp_{ky}_{c}"] = uni_w
-                            st.rerun()
-
-                # 逐列微调
+            with st.expander(f"配置重量: {info['title']} (工作表: {info['sheet_name']})"):
+                m1, m2 = st.columns(2)
+                with m1:
+                    bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", step=10.0)
+                with m2:
+                    bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
+                if st.button("一键平均填充", key=f"btn_{ky}"):
+                    for c in info["cols"]:
+                        st.session_state["ship_weights"][ky][c] = bt / max(bc, 1)
+                    st.rerun()
                 ci = st.columns(4)
                 for i, c in enumerate(info["cols"]):
-                    cur_val = float(st.session_state["ship_weights"][ky].get(c, 0.0))
-                    new_val = ci[i % 4].number_input(
-                        str(c), value=cur_val, key=f"inp_{ky}_{c}", step=0.5, format="%.1f"
+                    st.session_state["ship_weights"][ky][c] = ci[i % 4].number_input(
+                        str(c),
+                        value=float(st.session_state["ship_weights"][ky].get(c, 0.0)),
+                        key=f"inp_{ky}_{c}"
                     )
-                    st.session_state["ship_weights"][ky][c] = new_val
 
         if st.button("生成运费表", type="primary"):
-            # 统计每人每产品数量和总重
             ud: Dict[str, Dict] = {}
             tw = 0.0
             for fn, info in all_vcols.items():
@@ -832,15 +846,6 @@ with tab1:
             if tw == 0:
                 st.warning("总重为0，请检查重量配置")
             else:
-                # 计算每个产品的运费金额
-                def prod_fee(title, col):
-                    w = st.session_state["ship_weights"].get(f"ship_{[fn for fn,i in all_vcols.items() if i['title']==title][0]}", {}).get(col, 0.0)
-                    if "一" in scheme:
-                        return round_up(w * val_ship / tw)
-                    else:
-                        return round_up(w * val_ship)
-
-                # 构建 ship_blocks
                 ship_blocks = []
                 for fn, info in all_vcols.items():
                     ky = f"ship_{fn}"
@@ -879,11 +884,13 @@ with tab1:
                     rows_per_col_global,
                     global_title or "国际运费",
                     global_ddl, global_notice.splitlines(),
-                    global_left_img, global_qr_imgs
+                    chosen_left_img, chosen_qr_imgs
                 )
                 wb_s.close()
                 st.success(f"运费表生成完成！共 {len(ud)} 人，总重 {tw:.1f}g")
-                st.download_button("下载运费表", out.getvalue(), "运费表.xlsx")
+                
+                download_name = f"{global_title or '运费表'}_总表.xlsx"
+                st.download_button("下载运费表", out.getvalue(), download_name)
 
 with tab2:
     gu_files = st.file_uploader("上传排表 (肾表)", type=["xlsx"], accept_multiple_files=True)
@@ -906,18 +913,24 @@ with tab2:
         fmt = make_formats(wb_out, theme_choice)
         write_detail_sheet(wb_out.add_worksheet("详情表"), fmt, pp, tt, all_t, t_prods, t_prices,
                            rows_per_block_global, global_ddl, global_notice.splitlines(),
-                           global_left_img, global_qr_imgs, global_title)
+                           chosen_left_img, chosen_qr_imgs, global_title)
         write_simple_sheet(wb_out.add_worksheet("省流表"), fmt, tt,
                            global_title or " / ".join(all_t),
-                           rows_per_col_global, global_qr_imgs,
-                           global_notice.splitlines(), global_ddl, global_left_img)
+                           rows_per_col_global, chosen_qr_imgs,
+                           global_notice.splitlines(), global_ddl, chosen_left_img)
         usd = {"详情表", "省流表"}
+        
+        # 写入砍配过后的源表
         for t, f in src_d:
             f.seek(0)
             write_source_sheet(wb_out, t, f, usd)
+            
         wb_out.close()
-        st.success("肾表生成完成！")
-        st.download_button("下载肾表", out.getvalue(), "肾表.xlsx")
+        st.success("肾表生成完成！源工作表数据已过滤至砍配之后的分配结果。")
+        
+        # 按照用户填写的 标题_总表 方式命名
+        download_name = f"{global_title or '肾表'}_总表.xlsx"
+        st.download_button("下载肾表", out.getvalue(), download_name)
 
 with tab3:
     st.subheader("提取差额")
