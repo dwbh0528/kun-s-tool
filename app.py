@@ -86,25 +86,29 @@ def load_default_images() -> Tuple[Any, List[Any]]:
             except Exception:
                 pass
                 
-    # 自动检索默认收款码文件夹
-    qr_folder = Path("qr_codes")
-    if qr_folder.exists() and qr_folder.is_dir():
-        for ext in ["png", "jpg", "jpeg"]:
-            for p in sorted(qr_folder.glob(f"*.{ext}")):
-                try:
-                    with open(p, "rb") as f:
-                        qr_images.append(io.BytesIO(f.read()))
-                except Exception:
-                    pass
+    # 同时兼容 "qr_codes" 和 "收款码" 两个文件夹名字
+    for folder_name in ["qr_codes", "收款码"]:
+        qr_folder = Path(folder_name)
+        if qr_folder.exists() and qr_folder.is_dir():
+            for ext in ["png", "jpg", "jpeg", "JPG", "JPEG", "PNG"]:
+                for p in sorted(qr_folder.glob(f"*.{ext}")):
+                    try:
+                        with open(p, "rb") as f:
+                            qr_images.append(io.BytesIO(f.read()))
+                    except Exception:
+                        pass
+            if qr_images:
+                break
+                
     return left_img, qr_images
 
 # ─────────────────────────────────────────────
 # 2. 源表解析与砍配过滤逻辑
 # ─────────────────────────────────────────────
 
-def parse_source_file(uploaded_file) -> Tuple[str, List[str], List[float | None], List[Dict]]:
+def parse_source_file(uploaded_file, sheet_name: str | int | None = None) -> Tuple[str, List[str], List[float | None], List[Dict]]:
     uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file, header=None, engine="openpyxl", keep_default_na=True)
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name if sheet_name is not None else 0, header=None, engine="openpyxl", keep_default_na=True)
     header_idx = 0
     for i in range(min(8, len(df))):
         v = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
@@ -114,6 +118,10 @@ def parse_source_file(uploaded_file) -> Tuple[str, List[str], List[float | None]
     
     raw_title = str(df.iat[0, 0]) if not pd.isna(df.iat[0, 0]) else ""
     title = clean_title(raw_title)
+    
+    # 如果表格内无标题，则默认使用工作表名称作为标题
+    if not title and isinstance(sheet_name, str):
+        title = sheet_name
     
     price_row_idx = header_idx + 1
     products = [str(v) for v in df.iloc[header_idx].fillna("").tolist()[1:]]
@@ -152,10 +160,10 @@ def parse_source_file(uploaded_file) -> Tuple[str, List[str], List[float | None]
                         details.append({"name": name, "product": products[j], "price": price, "title": title})
     return title, products, prices, details
 
-def get_allocated_source_df(uploaded_file) -> pd.DataFrame:
+def get_allocated_source_df(uploaded_file, sheet_name: str | int | None = None) -> pd.DataFrame:
     """提取经过砍配逻辑过滤之后的源表 DataFrame，未成功匹配的行与冷门单元格将被清空"""
     uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file, header=None, engine="openpyxl", keep_default_na=True)
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name if sheet_name is not None else 0, header=None, engine="openpyxl", keep_default_na=True)
     header_idx = 0
     for i in range(min(8, len(df))):
         v = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
@@ -166,6 +174,9 @@ def get_allocated_source_df(uploaded_file) -> pd.DataFrame:
     raw_title = str(df.iat[0, 0]) if not pd.isna(df.iat[0, 0]) else ""
     title = clean_title(raw_title)
     
+    if not title and isinstance(sheet_name, str):
+        title = sheet_name
+        
     price_row_idx = header_idx + 1
     products = [str(v) for v in df.iloc[header_idx].fillna("").tolist()[1:]]
     prices = [to_num(x) for x in df.iloc[price_row_idx].fillna("").tolist()[1:]]
@@ -272,16 +283,13 @@ def draw_merged_group(ws, start_row, col, data_list, fmt):
 # ─────────────────────────────────────────────
 
 def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, left_img, qr_images):
-    # 强制使顶栏拥有至少 4 列的切分范围
     if total_cols < 4:
         total_cols = 4
         
-    # 精确切分 25% 边界 
     c1 = total_cols // 4
     c2 = total_cols // 2
     c3 = (total_cols * 3) // 4
     
-    # 确保列分界不重叠且合理递增
     if c1 < 1:
         c1 = 1
     if c2 <= c1:
@@ -291,11 +299,9 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
     if total_cols <= c3:
         total_cols = c3 + 1
     
-    # 第0行：大标题
     ws.merge_range(0, 0, 0, total_cols - 1, title_display, fmt["title_top"])
     ws.set_row(0, 40)
     
-    # 区域 1/4 (左)：名称或图片
     ws.merge_range(1, 0, 5, c1 - 1, title_display, fmt["left_name"])
     if left_img:
         img_data = get_image_bytes(left_img)
@@ -309,10 +315,8 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
             except Exception:
                 pass
             
-    # 区域 2/4 (中左)：备注文字
     ws.merge_range(1, c1, 5, c2 - 1, "\n".join(notice_lines), fmt["notice_center"])
     
-    # 区域 3/4 (中右)：收款码区域
     ws.merge_range(1, c2, 5, c3 - 1, "", fmt["notice_center"])
     if qr_images:
         for idx, qr in enumerate(qr_images[:2]):
@@ -328,17 +332,15 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
                 except Exception:
                     pass
                 
-    # 区域 4/4 (右)：DDL
     ws.merge_range(1, c3, 5, total_cols - 1, f"DDL\n{ddl_text}", fmt["ddl"])
     
-    # 根据是否包含图片自适应高度：无图时矮化处理，有图时设为 55
     has_images = bool(left_img or qr_images)
     row_height = 55 if has_images else 22
     for r in range(1, 6):
         ws.set_row(r, row_height)
 
 # ─────────────────────────────────────────────
-# 5. 详情表写入 (移除羊角标)
+# 5. 详情表写入
 # ─────────────────────────────────────────────
 
 def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, title_prices, rows_per_block, ddl_text, notice_lines, left_img, qr_images, custom_title):
@@ -366,7 +368,6 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
             for j, p in enumerate(prods):
                 ws.write(data_row + 1, curr + j, p, fmt["prod_head"])
                 price = (title_prices.get(t) or {}).get(p)
-                # 移除此处品种价格前的 “¥” 羊角标
                 if price is not None:
                     ws.write(data_row + 2, curr + j, price, fmt["prod_head"])
                 else:
@@ -413,7 +414,6 @@ def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, not
     num_blocks = math.ceil(len(rows_data) / rows_per_col)
     TOTAL_DATA_COLS = num_blocks * 4
     
-    # 限制最小定位列，防止小表头部错位
     if TOTAL_DATA_COLS < 8:
         TOTAL_DATA_COLS = 8
     
@@ -438,7 +438,6 @@ def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, not
         ws.set_column(c0 + 2, c0 + 2, 12)
         ws.set_column(c0 + 3, c0 + 3, 1)
 
-    # 格式化填充补位列
     for c in range(num_blocks * 4, TOTAL_DATA_COLS):
         ws.set_column(c, c, 12)
 
@@ -537,7 +536,7 @@ def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_tex
         ws.set_column(c0 + BLOCK_W, c0 + BLOCK_W, 1)
 
 # ─────────────────────────────────────────────
-# 8. 其余完整函数
+# 8. 其余完整函数与导入库核心提取逻辑
 # ─────────────────────────────────────────────
 
 def extract_simple_sheet(file):
@@ -606,27 +605,29 @@ def ai_fill_fields(goods_name: str, api_key: str) -> Tuple[str, str]:
         return "", ""
 
 
-def build_import_records(uploaded_files: list, api_key: str) -> Tuple[pd.DataFrame, List[str]]:
+def build_import_records(selected_inputs: list[Tuple[Any, str]], api_key: str) -> Tuple[pd.DataFrame, List[str]]:
+    """从用户自主选择的排表 Sheet 记录中提取并分析导入库数据"""
     today = date.today()
     stock_deadline = today + relativedelta(months=4)
     drop_deadline = stock_deadline + relativedelta(months=1)
-    today_str = today.strftime("%Y/%m/%d")
     stock_str = stock_deadline.strftime("%Y/%m/%d")
     drop_str = drop_deadline.strftime("%Y/%m/%d")
 
     logs: List[str] = []
     rows: List[Dict] = []
 
-    for f in uploaded_files:
+    for f, sheet_name in selected_inputs:
         f.seek(0)
         try:
-            title, products, prices, details = parse_source_file(f)
+            title, products, prices, details = parse_source_file(f, sheet_name=sheet_name)
         except Exception as e:
-            logs.append(f"{f.name} 解析失败: {e}")
+            logs.append(f"{f.name} - {sheet_name} 解析失败: {e}")
             continue
 
-        goods_name = extract_goods_name(title)
+        # 默认提取货品名称
+        goods_name = extract_goods_name(title) if title else sheet_name
 
+        # AI 辅助填写次名和类型
         ci_name, ci_type = "", ""
         if api_key:
             ci_name, ci_type = ai_fill_fields(goods_name, api_key)
@@ -635,10 +636,12 @@ def build_import_records(uploaded_files: list, api_key: str) -> Tuple[pd.DataFra
         else:
             logs.append("未填写 API Key，次名/类型留空")
 
+        # 统计每个 CN 购买的每个产品数量
         cn_prod: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for d in details:
             cn_prod[d["name"]][d["product"]] += 1
 
+        # 每个 CN × 每个产品 生成一行导入记录
         for cn, prod_qtys in cn_prod.items():
             for prod, qty in prod_qtys.items():
                 rows.append({
@@ -672,11 +675,10 @@ def write_import_sheet(wb, df, fmt):
             ws.write(r, c_idx, str(row[fd]), st_f)
         ws.set_row(r, 16)
 
-def write_source_sheet(wb, title, uploaded_file, used_names):
+def write_source_sheet(wb, title, uploaded_file, used_names, sheet_name=None):
     """写入源表：自动应用砍配逻辑，只导出保留配上的有效数据"""
     try:
-        # 获取砍配之后的 DataFrame
-        df = get_allocated_source_df(uploaded_file)
+        df = get_allocated_source_df(uploaded_file, sheet_name=sheet_name)
         
         nm = re.sub(r"[\\/*\[\]:?'\"<>|]", "-", title)[:28] or "源表"
         bs, sf = nm, 1
@@ -686,7 +688,6 @@ def write_source_sheet(wb, title, uploaded_file, used_names):
         used_names.add(nm)
         ws = wb.add_worksheet(nm)
         
-        # 写入过滤后压缩的数据
         for r_idx, row in enumerate(df.values):
             for c_idx, val in enumerate(row):
                 if pd.notna(val):
@@ -700,7 +701,6 @@ def write_source_sheet(wb, title, uploaded_file, used_names):
 
 st.set_page_config(page_title="谷团工具箱", layout="wide")
 
-# 加载本地/仓库预设的默认收款码与背景图
 default_left, default_qrs = load_default_images()
 
 with st.sidebar:
@@ -711,7 +711,6 @@ with st.sidebar:
     global_ddl = st.text_input("付款 DDL ", value="无特殊情况填写打表当日向后第七个自然日的晚上22:00")
     global_notice = st.text_area("中心备注大字 (中左 25%)", value="1.转账备注cn+本期谷子\n2.蓝绿双通无手续费\n3.拖肾一周内，每天请补交1r手续费，一周后未交掉落。两次及以上掉落记录飞机票\n4....", height=180)
     
-    # 允许上传自定义左图，否则自动加载默认
     global_left_img = st.file_uploader("左侧背景图（不传则读取预设）", type=["png","jpg","jpeg"])
     if not global_left_img and default_left:
         st.caption("💡 已自动检索到默认左侧背景图 (left_bg)")
@@ -719,7 +718,6 @@ with st.sidebar:
     else:
         chosen_left_img = global_left_img
 
-    # 允许上传自定义收款码，否则自动加载默认
     global_qr_imgs = st.file_uploader("收款码（可多选，不传则读取预设）", type=["png","jpg","jpeg"], accept_multiple_files=True)
     if not global_qr_imgs and default_qrs:
         st.caption(f"💡 已自动检索到默认收款码文件夹中的 {len(default_qrs)} 张收款码 (qr_codes/)")
@@ -753,13 +751,11 @@ with tab1:
             xl = pd.ExcelFile(f)
             sheet_names = xl.sheet_names
             
-            # 默认过滤非数据用的 Sheet
             default_exclude = ["详情表", "省流表", "汇总表", "运费表", "导入库", "Sheet1"]
             candidate_sheets = [s for s in sheet_names if s not in default_exclude]
             if not candidate_sheets:
                 candidate_sheets = sheet_names
                 
-            # 提供自主勾选与删除 Sheet 模块
             selected_sheets = st.multiselect(
                 f"选择文件【{f.name}】中参与计算运费的 Sheet (可自由增删)",
                 options=sheet_names,
@@ -920,7 +916,6 @@ with tab2:
                            global_notice.splitlines(), global_ddl, chosen_left_img)
         usd = {"详情表", "省流表"}
         
-        # 写入砍配过后的源表
         for t, f in src_d:
             f.seek(0)
             write_source_sheet(wb_out, t, f, usd)
@@ -928,7 +923,6 @@ with tab2:
         wb_out.close()
         st.success("肾表生成完成！源工作表数据已过滤至砍配之后的分配结果。")
         
-        # 按照用户填写的 标题_总表 方式命名
         download_name = f"{global_title or '肾表'}_总表.xlsx"
         st.download_button("下载肾表", out.getvalue(), download_name)
 
@@ -948,21 +942,48 @@ with tab4:
     im_files = st.file_uploader("上传排表 xlsx（可多选）", type=["xlsx"], accept_multiple_files=True)
     deepseek_key = st.text_input("DeepSeek API Key（不填则次名/类型留空）", type="password")
 
+    # 汇总自主选择的 Sheet
+    selected_im_inputs = []
+    if im_files:
+        for f in im_files:
+            f.seek(0)
+            xl = pd.ExcelFile(f)
+            sheet_names = xl.sheet_names
+            
+            # 自动过滤汇总表和省流表
+            default_exclude = ["详情表", "省流表", "汇总表", "运费表", "导入库", "Sheet1"]
+            candidate_sheets = [s for s in sheet_names if s not in default_exclude]
+            if not candidate_sheets:
+                candidate_sheets = sheet_names
+                
+            selected_sheets = st.multiselect(
+                f"选择文件【{f.name}】中导入库存的 Sheet (可自由删减)",
+                options=sheet_names,
+                default=candidate_sheets,
+                key=f"im_sheets_{f.name}"
+            )
+            
+            for s in selected_sheets:
+                selected_im_inputs.append((f, s))
+
     if im_files and st.button("🚀 生成导入库表", type="primary"):
-        with st.spinner("处理中，AI 推断字段可能需要几秒..."):
-            df_im, logs = build_import_records(im_files, deepseek_key)
-        if logs:
-            with st.expander("⚠️ 处理日志"):
-                for l in logs:
-                    st.caption(l)
-        if df_im.empty:
-            st.warning("未提取到任何记录，请检查文件格式")
+        if not selected_im_inputs:
+            st.warning("请至少选择一个工作表 (Sheet) 进行导入库计算！")
         else:
-            st.success(f"提取到 {len(df_im)} 条记录")
-            st.dataframe(df_im, use_container_width=True)
-            out_im = io.BytesIO()
-            wb_im = xlsxwriter.Workbook(out_im)
-            fmt_im = make_formats(wb_im, theme_choice)
-            write_import_sheet(wb_im, df_im, fmt_im)
-            wb_im.close()
-            st.download_button("下载导入库表", out_im.getvalue(), "导入库.xlsx")
+            with st.spinner("处理中，AI 推断字段可能需要几秒..."):
+                df_im, logs = build_import_records(selected_im_inputs, deepseek_key)
+            if logs:
+                with st.expander("⚠️ 处理日志"):
+                    for l in logs:
+                        st.caption(l)
+            if df_im.empty:
+                st.warning("未提取到任何记录，请检查文件格式")
+            else:
+                st.success(f"提取到 {len(df_im)} 条记录")
+                st.dataframe(df_im, use_container_width=True)
+                out_im = io.BytesIO()
+                wb_im = xlsxwriter.Workbook(out_im)
+                fmt_im = make_formats(wb_im, theme_choice)
+                write_import_sheet(wb_im, df_im, fmt_im)
+                wb_im.close()
+                st.download_button("下载导入库表", out_im.getvalue(), "导入库.xlsx")
