@@ -340,7 +340,7 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
         ws.set_row(r, row_height)
 
 # ─────────────────────────────────────────────
-# 5. 详情表写入
+# 5. 详情表写入 (縱向排列，前後對照)
 # ─────────────────────────────────────────────
 
 def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, title_prices, rows_per_block, ddl_text, notice_lines, left_img, qr_images, custom_title):
@@ -404,7 +404,7 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
     ws.set_column(TOTAL_COLS - 1, TOTAL_COLS - 1, 5)
 
 # ─────────────────────────────────────────────
-# 6. 省流表写入
+# 6. 省流表写入 (橫向分割)
 # ─────────────────────────────────────────────
 
 def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, notice_lines, ddl_text, left_img):
@@ -442,101 +442,7 @@ def write_simple_sheet(ws, fmt, totals, title_text, rows_per_col, qr_images, not
         ws.set_column(c, c, 12)
 
 # ─────────────────────────────────────────────
-# 7. 国际运费表写入
-# ─────────────────────────────────────────────
-
-def write_shipping_sheet(ws, fmt, ship_blocks, rows_per_col, title_text, ddl_text, notice_lines, left_img, qr_images):
-    TOP_ROWS = 6
-
-    all_names_set = {}
-    for blk in ship_blocks:
-        for e in blk["entries"]:
-            n = e["name"]
-            if n not in all_names_set:
-                all_names_set[n] = defaultdict(lambda: defaultdict(float))
-            for prod, qty in e["prod_amounts"].items():
-                all_names_set[n][blk["title"]][prod] += qty
-
-    col_map = [(blk["title"], p) for blk in ship_blocks for p in blk["products"]]
-    prod_fee_map = {(blk["title"], p): blk["prod_fees"].get(p, 0.0)
-                    for blk in ship_blocks for p in blk["products"]}
-
-    sorted_names = sorted(all_names_set.keys(), key=lambda n: (get_group_key(n), n))
-    rows_data = []
-    for name in sorted_names:
-        total_fee = sum(
-            all_names_set[name][t][p] * prod_fee_map.get((t, p), 0.0)
-            for t, p in col_map
-        )
-        rows_data.append({
-            "group": get_group_key(name),
-            "name": name,
-            "amounts": {(t, p): all_names_set[name][t][p] for t, p in col_map},
-            "total": total_fee,
-        })
-
-    if not rows_data:
-        return
-
-    N_PROD = len(col_map)
-    BLOCK_W = 2 + N_PROD + 1   
-    STEP = BLOCK_W + 1          
-    num_blocks = math.ceil(len(rows_data) / rows_per_col)
-    TOTAL_DATA_COLS = num_blocks * STEP
-    if TOTAL_DATA_COLS < 8:
-        TOTAL_DATA_COLS = 8
-
-    draw_top_banner(ws, fmt, TOTAL_DATA_COLS, title_text, notice_lines, ddl_text, left_img, qr_images)
-
-    HEADER_ROWS = 3
-    data_header_row = TOP_ROWS
-
-    for b in range(num_blocks):
-        c0 = b * STEP
-        chunk = rows_data[b * rows_per_col: (b + 1) * rows_per_col]
-
-        ws.merge_range(data_header_row, c0, data_header_row + 2, c0, "组", fmt["head"])
-        ws.merge_range(data_header_row, c0 + 1, data_header_row + 2, c0 + 1, "CN", fmt["head"])
-
-        curr = c0 + 2
-        for blk in ship_blocks:
-            n = len(blk["products"])
-            if n > 1:
-                ws.merge_range(data_header_row, curr, data_header_row, curr + n - 1,
-                               blk["title"], fmt["gu_merge"])
-            else:
-                ws.write(data_header_row, curr, blk["title"], fmt["gu_merge"])
-            for j, p in enumerate(blk["products"]):
-                ws.write(data_header_row + 1, curr + j, p, fmt["prod_head"])
-                fee = blk["prod_fees"].get(p, 0.0)
-                ws.write(data_header_row + 2, curr + j, f"¥{fee:.2f}", fmt["prod_head"])
-            curr += n
-
-        ws.merge_range(data_header_row, curr, data_header_row + 2, curr, "总运费", fmt["head"])
-
-        data_row = data_header_row + HEADER_ROWS
-        for i, d in enumerate(chunk):
-            r = data_row + i
-            st_f = fmt["odd"] if i % 2 == 0 else fmt["even"]
-            mn_f = fmt["money_odd"] if i % 2 == 0 else fmt["money_even"]
-            ws.write(r, c0 + 1, d["name"], st_f)
-            for ci, (t, p) in enumerate(col_map):
-                qty = d["amounts"].get((t, p), 0.0)
-                ws.write(r, c0 + 2 + ci, int(qty) if qty > 0 else "", st_f)
-            ws.write(r, c0 + 2 + N_PROD, d["total"], mn_f)
-            ws.set_row(r, 18)
-
-        draw_merged_group(ws, data_row, c0, chunk, fmt["group"])
-
-        ws.set_column(c0, c0, 5)
-        ws.set_column(c0 + 1, c0 + 1, 22)
-        for ci in range(N_PROD):
-            ws.set_column(c0 + 2 + ci, c0 + 2 + ci, 8)
-        ws.set_column(c0 + 2 + N_PROD, c0 + 2 + N_PROD, 12)
-        ws.set_column(c0 + BLOCK_W, c0 + BLOCK_W, 1)
-
-# ─────────────────────────────────────────────
-# 8. 其余完整函数与导入库核心提取逻辑
+# 7. 其余完整函数与导入库核心提取逻辑
 # ─────────────────────────────────────────────
 
 def extract_simple_sheet(file):
@@ -826,7 +732,7 @@ with tab1:
             
             with st.expander(f"配置重量: 【{info['title']}】 排表 (工作表: {info['sheet_name']})"):
                 
-                # ── 新的模式选择：完全贴合你的逻辑 ──
+                # ── 新的模式选择 ──
                 mode_key = f"mode_{ky}"
                 if mode_key not in st.session_state:
                     st.session_state[mode_key] = "A. 整盒配比"
@@ -898,8 +804,6 @@ with tab1:
                     if w_key not in st.session_state:
                         st.session_state[w_key] = 0.0
                         
-                    # ⚠️ 修复关键：不使用赋值形式。
-                    # 在 Streamlit 中，将输入组件直接绑定到 key 时，无需用“等号”重新把返回值赋回 session_state。
                     ci[i % 4].number_input(
                         str(c),
                         key=w_key,
@@ -932,7 +836,7 @@ with tab1:
             if tw == 0:
                 st.warning("当前各单品配置的总重量为0，请先配置重量。")
             else:
-                # 第二步：生成各个产品列的运费单价
+                # 第二步：将运费数据完美映射转换为与肾表 100% 对应的一致结构
                 ship_blocks = []
                 for fn, info in all_vcols.items():
                     ky = f"ship_{fn}"
@@ -963,16 +867,48 @@ with tab1:
                         "entries": entries,
                     })
 
+                # 构建映射变量
+                all_titles = [blk["title"] for blk in ship_blocks]
+                t_prods = {blk["title"]: blk["products"] for blk in ship_blocks}
+                t_prices = {blk["title"]: blk["prod_fees"] for blk in ship_blocks}
+                
+                pp = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+                for blk in ship_blocks:
+                    for e in blk["entries"]:
+                        name = e["name"]
+                        for p, qty in e["prod_amounts"].items():
+                            if qty > 0:
+                                fee = blk["prod_fees"].get(p, 0.0)
+                                pp[name][blk["title"]][p] = [fee] * int(qty)
+                                
+                tt = defaultdict(float)
+                for name in pp.keys():
+                    total_fee = 0.0
+                    for t in all_titles:
+                        for p in t_prods.get(t, []):
+                            total_fee += sum(pp[name][t][p])
+                    tt[name] = total_fee
+
+                # 创建 Workbook 写入具有相同详情与省流两张表的 Excel 文件
                 out = io.BytesIO()
                 wb_s = xlsxwriter.Workbook(out)
                 fmt_s = make_formats(wb_s, theme_choice)
-                write_shipping_sheet(
-                    wb_s.add_worksheet("运费表"), fmt_s, ship_blocks,
-                    rows_per_col_global,
-                    global_title or "国际运费",
-                    global_ddl, global_notice.splitlines(),
-                    chosen_left_img, chosen_qr_imgs
+                
+                # 写入 详情表 (纵向排列，前后对照)
+                write_detail_sheet(
+                    wb_s.add_worksheet("详情表"), fmt_s, pp, tt, all_titles, t_prods, t_prices,
+                    rows_per_block_global, global_ddl, global_notice.splitlines(),
+                    chosen_left_img, chosen_qr_imgs, global_title or "国际运费详情"
                 )
+                
+                # 写入 省流表 (横向分割)
+                write_simple_sheet(
+                    wb_s.add_worksheet("省流表"), fmt_s, tt,
+                    global_title or " / ".join(all_titles),
+                    rows_per_col_global, chosen_qr_imgs,
+                    global_notice.splitlines(), global_ddl, chosen_left_img
+                )
+                
                 wb_s.close()
                 st.success(f"运费表生成完成！共 {len(ud)} 人，总重 {tw:.1f}g")
                 
