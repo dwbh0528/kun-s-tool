@@ -103,7 +103,7 @@ def load_default_images() -> Tuple[Any, List[Any]]:
     return left_img, qr_images
 
 # ─────────────────────────────────────────────
-# 2. 源表解析与砍配过滤逻辑
+# 2. 源表解析与砍配过滤逻辑 (保护岛内列、允许 0 价列)
 # ─────────────────────────────────────────────
 
 def parse_source_file(uploaded_file, sheet_name: str | int | None = None) -> Tuple[str, List[str], List[float | None], List[Dict]]:
@@ -144,8 +144,9 @@ def parse_source_file(uploaded_file, sheet_name: str | int | None = None) -> Tup
             for j, cell in enumerate(cells):
                 if cell_has_cn(cell) and j < len(products):
                     name = str(cell).strip()
-                    price = prices[j]
-                    if name and price and price > 0:
+                    # 价格为空或非数字时默认为 0.0，不因价格过滤掉岛内/辅助列
+                    price = prices[j] if (prices[j] is not None and prices[j] >= 0) else 0.0
+                    if name:
                         details.append({"name": name, "product": products[j], "price": price, "title": title})
         else:
             non_box_filled = [cell_has_cn(cells[j]) for j in range(len(cells)) if j < len(is_box_col) and not is_box_col[j]]
@@ -155,8 +156,8 @@ def parse_source_file(uploaded_file, sheet_name: str | int | None = None) -> Tup
                     continue
                 if is_box_col[j] or row_ready:
                     name = str(cell).strip()
-                    price = prices[j]
-                    if name and price and price > 0:
+                    price = prices[j] if (prices[j] is not None and prices[j] >= 0) else 0.0
+                    if name:
                         details.append({"name": name, "product": products[j], "price": price, "title": title})
     return title, products, prices, details
 
@@ -209,7 +210,10 @@ def get_allocated_source_df(uploaded_file, sheet_name: str | int | None = None) 
                 if not row_ready:
                     # 如果这盒没能拼成，只保留抱盒或端盒，其余散件清空
                     for j in range(len(products)):
-                        if j < len(is_box_col) and not is_box_col[j]:
+                        p_name = products[j]
+                        # 保护非拼箱/非配比的辅助列（如 岛内、国运、国内、国际、均摊、运费等）不被清除
+                        is_aux_col = any(x in p_name for x in ["岛内", "国运", "国际", "国内", "均摊", "运费"])
+                        if j < len(is_box_col) and not is_box_col[j] and not is_aux_col:
                             df.iat[r, 1 + j] = None
                             
     filtered_df = df.iloc[keep_rows].copy()
@@ -340,12 +344,27 @@ def draw_top_banner(ws, fmt, total_cols, title_display, notice_lines, ddl_text, 
         ws.set_row(r, row_height)
 
 # ─────────────────────────────────────────────
-# 5. 详情表写入 (縱向排列，前後對照)
+# 5. 详情表写入 (自动过滤无任何人排的闲置列)
 # ─────────────────────────────────────────────
 
 def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, title_prices, rows_per_block, ddl_text, notice_lines, left_img, qr_images, custom_title):
     TOP_ROWS = 6
-    col_map = [(t, p) for t in all_titles for p in title_products.get(t, [])]
+    
+    # ── 新增过滤机制 ──
+    # 检索在当前项目中，所有人的所有订单。找出其中至少被排过一次（数量 > 0）的有效列
+    active_products = set()
+    for name in per_person:
+        for t in per_person[name]:
+            for p in per_person[name][t]:
+                if len(per_person[name][t][p]) > 0:
+                    active_products.add((t, p))
+                    
+    # 为每一个子表单独剔除完全没有人排的闲置列，保证排版极其紧凑
+    filtered_title_products = {}
+    for t in all_titles:
+        filtered_title_products[t] = [p for p in title_products.get(t, []) if (t, p) in active_products]
+        
+    col_map = [(t, p) for t in all_titles for p in filtered_title_products.get(t, [])]
     N_SIDE, N_PROD = 3, len(col_map)
     TOTAL_COLS = N_SIDE + N_PROD + N_SIDE
     sorted_names = sorted(totals.keys(), key=lambda n: (get_group_key(n), n))
@@ -359,8 +378,10 @@ def write_detail_sheet(ws, fmt, per_person, totals, all_titles, title_products, 
             ws.merge_range(data_row, c, data_row + 2, c, h, fmt["head"])
         curr = N_SIDE
         for t in all_titles:
-            prods = title_products[t]
+            prods = filtered_title_products.get(t, [])
             n = len(prods)
+            if n == 0:
+                continue # 如果该 Sheet 下没有任何一列有人排，则在表头跳过显示
             if n > 1:
                 ws.merge_range(data_row, curr, data_row, curr + n - 1, t, fmt["gu_merge"])
             else:
@@ -732,7 +753,7 @@ with tab1:
             
             with st.expander(f"配置重量: 【{info['title']}】 排表 (工作表: {info['sheet_name']})"):
                 
-                # ── 新的模式选择 ──
+                # ── 模式选择 ──
                 mode_key = f"mode_{ky}"
                 if mode_key not in st.session_state:
                     st.session_state[mode_key] = "A. 整盒配比"
@@ -925,7 +946,8 @@ with tab2:
             if t not in all_t:
                 all_t.append(t)
             t_prods[t] = p
-            t_prices[t] = {p[i]: pr[i] for i in range(len(p)) if i < len(pr) and pr[i] is not None}
+            # 若原始表格价格行有空值（如岛内运费列价格），默认为 0.0，不滤除此类辅助性价格列
+            t_prices[t] = {p[i]: (pr[i] if pr[i] is not None else 0.0) for i in range(len(p)) if i < len(pr)}
             all_d.extend(d)
             f.seek(0)
             src_d.append((t, f))
