@@ -802,7 +802,7 @@ with tab1:
                 
                 f.seek(0)
                 df_s = pd.read_excel(f, sheet_name=sheet, header=header_idx, engine="openpyxl")
-                bad = ["种类","序号","单价","总计","合计","Unnamed","备注","补款","余量"]
+                bad = ["种类","序号","单极","总计","合计","Unnamed","备注","补款","余量"]
                 cols = [c for c in df_s.columns if str(c).strip() and not any(b in str(c) for b in bad)]
                 
                 valid = []
@@ -825,54 +825,68 @@ with tab1:
             ky = f"ship_{fn}"
             
             with st.expander(f"配置重量: 【{info['title']}】 排表 (工作表: {info['sheet_name']})"):
-                # ── 模块 1：平均填充 ──
-                col1, col2, col3 = st.columns([2, 2, 2])
-                with col1:
-                    bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", min_value=0.0, step=10.0, format="%.2f")
-                with col2:
-                    bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
-                with col3:
-                    st.write("") # 占位
-                    st.write("") # 占位
-                    if st.button("一键平均填充", key=f"btn_avg_{ky}", use_container_width=True):
+                
+                # ── 新的模式选择：完全贴合你的逻辑 ──
+                mode_key = f"mode_{ky}"
+                if mode_key not in st.session_state:
+                    st.session_state[mode_key] = "A. 整盒配比"
+                    
+                mode = st.radio(
+                    "模式",
+                    ["A. 整盒配比", "B. 混合/关键词", "C. 统一重量"],
+                    key=mode_key,
+                    horizontal=True
+                )
+                
+                if mode == "A. 整盒配比":
+                    col1, col2, col3 = st.columns([2, 2, 2])
+                    with col1:
+                        bt = st.number_input("整盒重", key=f"bt_{ky}", min_value=0.0, step=10.0, format="%.2f")
+                    with col2:
+                        bc = st.number_input("数量", key=f"bc_{ky}", value=1, min_value=1)
+                    with col3:
+                        box_kw = st.text_input("端盒关键词", key=f"box_kw_{ky}", value="端盒,抱盒")
+                    
+                    if st.button("计算填充", key=f"btn_calc_{ky}"):
+                        kws = [k.strip() for k in box_kw.replace("，", ",").split(",") if k.strip()]
                         avg_val = bt / max(bc, 1)
                         for c in info["cols"]:
-                            st.session_state[f"inp_{ky}_{c}"] = avg_val
+                            w_key = f"inp_{ky}_{c}"
+                            is_box = any(kw in str(c) for kw in kws)
+                            st.session_state[w_key] = bt if is_box else avg_val
                         st.rerun()
-                
-                st.divider()
-                
-                # ── 模块 2：一键统一填充相同重量 ──
-                col_same1, col_same2 = st.columns([4, 2])
-                with col_same1:
-                    same_val = st.number_input("输入要统一填充的重量(g)", key=f"same_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
-                with col_same2:
-                    st.write("") # 占位
-                    st.write("") # 占位
-                    if st.button("一键填充相同重量", key=f"btn_same_{ky}", use_container_width=True):
-                        for c in info["cols"]:
-                            st.session_state[f"inp_{ky}_{c}"] = same_val
-                        st.rerun()
-                
-                st.divider()
-                
-                # ── 模块 3：单 Sheet 关键词即时匹配填充 ──
-                col_kw1, col_kw2, col_kw3 = st.columns([2, 2, 2])
-                with col_kw1:
-                    kw_str = st.text_input("输入在本页匹配的关键词（如 “生写” ）", key=f"kw_{ky}")
-                with col_kw2:
-                    kw_val = st.number_input("输入匹配项的目标重量(g)", key=f"kw_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
-                with col_kw3:
-                    st.write("") # 占位
-                    st.write("") # 占位
-                    if st.button("一键匹配匹配该关键词", key=f"btn_kw_{ky}", use_container_width=True):
-                        if kw_str.strip():
+                        
+                elif mode == "B. 混合/关键词":
+                    col1, col2, col3 = st.columns([4, 2, 2])
+                    with col1:
+                        kw_str = st.text_input("关键词", key=f"kw_{ky}")
+                    with col2:
+                        kw_val = st.number_input("重量", key=f"kw_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
+                    with col3:
+                        st.write("") # 占位
+                        st.write("") # 占位
+                        if st.button("应用", key=f"btn_kw_{ky}", use_container_width=True):
+                            if kw_str.strip():
+                                for c in info["cols"]:
+                                    if kw_str.strip() in str(c):
+                                        w_key = f"inp_{ky}_{c}"
+                                        st.session_state[w_key] = kw_val
+                                st.rerun()
+                            else:
+                                st.warning("请输入关键词后再点击应用")
+                                
+                elif mode == "C. 统一重量":
+                    col1, col2 = st.columns([4, 2])
+                    with col1:
+                        uni_val = st.number_input("统一重量", key=f"uni_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
+                    with col2:
+                        st.write("") # 占位
+                        st.write("") # 占位
+                        if st.button("应用", key=f"btn_uni_{ky}", use_container_width=True):
                             for c in info["cols"]:
-                                if kw_str.strip() in str(c):
-                                    st.session_state[f"inp_{ky}_{c}"] = kw_val
+                                w_key = f"inp_{ky}_{c}"
+                                st.session_state[w_key] = uni_val
                             st.rerun()
-                        else:
-                            st.warning("请输入关键词后再点击匹配")
                             
                 st.divider()
                 
@@ -884,9 +898,10 @@ with tab1:
                     if w_key not in st.session_state:
                         st.session_state[w_key] = 0.0
                         
-                    st.session_state[w_key] = ci[i % 4].number_input(
+                    # ⚠️ 修复关键：不使用赋值形式。
+                    # 在 Streamlit 中，将输入组件直接绑定到 key 时，无需用“等号”重新把返回值赋回 session_state。
+                    ci[i % 4].number_input(
                         str(c),
-                        value=float(st.session_state.get(w_key, 0.0)),
                         key=w_key,
                         min_value=0.0,
                         step=1.0,
