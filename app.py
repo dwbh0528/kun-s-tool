@@ -767,9 +767,6 @@ with tab1:
         val_ship = st.number_input("金额（方案一填总运费，方案二填克单价）", 0.0, format="%.4f")
 
     if ship_files:
-        if "ship_weights" not in st.session_state:
-            st.session_state["ship_weights"] = {}
-            
         all_vcols = {}
         for f in ship_files:
             f.seek(0)
@@ -826,33 +823,86 @@ with tab1:
 
         for fn, info in all_vcols.items():
             ky = f"ship_{fn}"
-            if ky not in st.session_state["ship_weights"]:
-                st.session_state["ship_weights"][ky] = {c: 0.0 for c in info["cols"]}
-            with st.expander(f"配置重量: {info['title']} (工作表: {info['sheet_name']})"):
-                m1, m2 = st.columns(2)
-                with m1:
-                    bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", step=10.0)
-                with m2:
+            
+            with st.expander(f"配置重量: 【{info['title']}】 排表 (工作表: {info['sheet_name']})"):
+                # ── 模块 1：平均填充 ──
+                col1, col2, col3 = st.columns([2, 2, 2])
+                with col1:
+                    bt = st.number_input("整盒总重(g)", key=f"bt_{ky}", min_value=0.0, step=10.0, format="%.2f")
+                with col2:
                     bc = st.number_input("整盒数量", key=f"bc_{ky}", value=1, min_value=1)
-                if st.button("一键平均填充", key=f"btn_{ky}"):
-                    for c in info["cols"]:
-                        st.session_state["ship_weights"][ky][c] = bt / max(bc, 1)
-                    st.rerun()
+                with col3:
+                    st.write("") # 占位
+                    st.write("") # 占位
+                    if st.button("一键平均填充", key=f"btn_avg_{ky}", use_container_width=True):
+                        avg_val = bt / max(bc, 1)
+                        for c in info["cols"]:
+                            st.session_state[f"inp_{ky}_{c}"] = avg_val
+                        st.rerun()
+                
+                st.divider()
+                
+                # ── 模块 2：一键统一填充相同重量 ──
+                col_same1, col_same2 = st.columns([4, 2])
+                with col_same1:
+                    same_val = st.number_input("输入要统一填充的重量(g)", key=f"same_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
+                with col_same2:
+                    st.write("") # 占位
+                    st.write("") # 占位
+                    if st.button("一键填充相同重量", key=f"btn_same_{ky}", use_container_width=True):
+                        for c in info["cols"]:
+                            st.session_state[f"inp_{ky}_{c}"] = same_val
+                        st.rerun()
+                
+                st.divider()
+                
+                # ── 模块 3：单 Sheet 关键词即时匹配填充 ──
+                col_kw1, col_kw2, col_kw3 = st.columns([2, 2, 2])
+                with col_kw1:
+                    kw_str = st.text_input("输入在本页匹配的关键词（如 “生写” ）", key=f"kw_{ky}")
+                with col_kw2:
+                    kw_val = st.number_input("输入匹配项的目标重量(g)", key=f"kw_val_{ky}", min_value=0.0, step=1.0, format="%.2f")
+                with col_kw3:
+                    st.write("") # 占位
+                    st.write("") # 占位
+                    if st.button("一键匹配匹配该关键词", key=f"btn_kw_{ky}", use_container_width=True):
+                        if kw_str.strip():
+                            for c in info["cols"]:
+                                if kw_str.strip() in str(c):
+                                    st.session_state[f"inp_{ky}_{c}"] = kw_val
+                            st.rerun()
+                        else:
+                            st.warning("请输入关键词后再点击匹配")
+                            
+                st.divider()
+                
+                # ── 模块 4：手工微调网格 ──
+                st.subheader("手工调整各单品重量 (g)")
                 ci = st.columns(4)
                 for i, c in enumerate(info["cols"]):
-                    st.session_state["ship_weights"][ky][c] = ci[i % 4].number_input(
+                    w_key = f"inp_{ky}_{c}"
+                    if w_key not in st.session_state:
+                        st.session_state[w_key] = 0.0
+                        
+                    st.session_state[w_key] = ci[i % 4].number_input(
                         str(c),
-                        value=float(st.session_state["ship_weights"][ky].get(c, 0.0)),
-                        key=f"inp_{ky}_{c}"
+                        value=float(st.session_state.get(w_key, 0.0)),
+                        key=w_key,
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f"
                     )
 
         if st.button("生成运费表", type="primary"):
             ud: Dict[str, Dict] = {}
             tw = 0.0
+            
+            # 第一步：汇总所有人购买的件数和对应的总重量
             for fn, info in all_vcols.items():
-                w_cfg = st.session_state["ship_weights"].get(f"ship_{fn}", {})
+                ky = f"ship_{fn}"
                 for col in info["cols"]:
-                    w = w_cfg.get(col, 0.0)
+                    w_key = f"inp_{ky}_{col}"
+                    w = st.session_state.get(w_key, 0.0)
                     for vn in info["df"][col].iloc[1:]:
                         if pd.notna(vn):
                             n = str(vn).strip()
@@ -865,16 +915,17 @@ with tab1:
                             tw += w
 
             if tw == 0:
-                st.warning("总重为0，请检查重量配置")
+                st.warning("当前各单品配置的总重量为0，请先配置重量。")
             else:
+                # 第二步：生成各个产品列的运费单价
                 ship_blocks = []
                 for fn, info in all_vcols.items():
                     ky = f"ship_{fn}"
-                    w_cfg = st.session_state["ship_weights"].get(ky, {})
                     prods = info["cols"]
                     pf = {}
                     for col in prods:
-                        w = w_cfg.get(col, 0.0)
+                        w_key = f"inp_{ky}_{col}"
+                        w = st.session_state.get(w_key, 0.0)
                         if "一" in scheme:
                             pf[col] = round_up(w * val_ship / tw) if tw > 0 else 0.0
                         else:
